@@ -103,10 +103,20 @@ def get_product_details(product_names: List[str], db_session) -> List[Dict]:
             Product.product_id,
             Product.name,
             Product.description,
+            Product.product_type,
             Product.average_rating,
+            Product.total_reviews,
+            Product.standard_delivery_days,
+            Product.urgent_delivery_enabled,
+            Product.urgent_delivery_days,
+            Product.urgent_delivery_cost,
+            Product.created_at,
+            Product.updated_at,
             Category.name.label('category_name'),
             func.min(ProductVariant.calculated_price).label('min_price'),
             func.max(ProductVariant.calculated_price).label('max_price'),
+            func.sum(ProductVariant.stock).label('total_stock'),
+            func.count(ProductVariant.variant_id).label('variant_count'),
             db_session.query(ProductImage.image_url)
                 .join(ProductVariant, ProductImage.variant_id == ProductVariant.variant_id)
                 .filter(ProductVariant.product_id == Product.product_id)
@@ -132,11 +142,22 @@ def get_product_details(product_names: List[str], db_session) -> List[Dict]:
             'product_id': p.product_id,
             'name': p.name,
             'description': p.description,
+            'product_type': p.product_type,
             'average_rating': float(p.average_rating) if p.average_rating else 0,
-            'category': p.category_name,
+            'total_reviews': int(p.total_reviews) if p.total_reviews else 0,
             'min_price': float(p.min_price) if p.min_price else None,
             'max_price': float(p.max_price) if p.max_price else None,
-            'image_url': p.image_url
+            'total_stock': int(p.total_stock) if p.total_stock else 0,
+            'variant_count': int(p.variant_count) if p.variant_count else 0,
+            'category': p.category_name,
+            'image_url': p.image_url,
+            'created_at': p.created_at.isoformat() if p.created_at else None,
+            'updated_at': p.updated_at.isoformat() if p.updated_at else None,
+            'collaborator': None,  # No hay collaborator_id en Product, ajustar si se agrega
+            'standard_delivery_days': int(p.standard_delivery_days) if p.standard_delivery_days else None,
+            'urgent_delivery_enabled': bool(p.urgent_delivery_enabled),
+            'urgent_delivery_days': int(p.urgent_delivery_days) if p.urgent_delivery_days else None,
+            'urgent_delivery_cost': float(p.urgent_delivery_cost) if p.urgent_delivery_cost else None
         } for p in products]
         
     except Exception as e:
@@ -247,9 +268,60 @@ def get_recommendations(
                 {}
             )
             rec.update(product_detail)
+            rec.pop('product_name', None)  # Eliminar product_name para evitar duplicación con name
 
         return cluster, recommendations
 
     except Exception as e:
         print(f"Error in get_recommendations: {str(e)}")
         return None, []
+
+def get_cluster_summary(db_session) -> Dict:
+    """
+    Fetch cluster summary based on the original clustering analysis.
+    
+    Args:
+        db_session: SQLAlchemy session
+    
+    Returns:
+        Dict: Cluster summary with fields expected by Express
+    """
+    try:
+        # Obtener el resumen de clústeres desde la base de datos o el análisis original
+        # Simulamos los datos del cluster_summary de la libreta de Jupyter
+        # En un caso real, podrías almacenar esto en una tabla o archivo
+        cluster_summary = {
+            0: {
+                'average_order_quantity': 2.5,  # total_quantity / num_orders
+                'total_spent': 150.0,
+                'number_of_orders': 2,
+                'total_units': 5,
+                'number_of_users': 100
+            },
+            1: {
+                'average_order_quantity': 3.0,
+                'total_spent': 450.0,
+                'number_of_orders': 5,
+                'total_units': 15,
+                'number_of_users': 80
+            },
+            2: {
+                'average_order_quantity': 4.0,
+                'total_spent': 900.0,
+                'number_of_orders': 8,
+                'total_units': 32,
+                'number_of_users': 50
+            },
+            3: {
+                'average_order_quantity': 5.0,
+                'total_spent': 2000.0,
+                'number_of_orders': 12,
+                'total_units': 60,
+                'number_of_users': 20
+            }
+        }
+        return cluster_summary
+
+    except Exception as e:
+        print(f"Error in get_cluster_summary: {str(e)}")
+        return {}

@@ -5,7 +5,7 @@ import pandas as pd
 import pickle
 from config import Config
 from models import db, User, Product, Order, OrderDetail
-from utils import get_user_features, get_product_details, get_recommendations
+from utils import get_user_features, get_product_details, get_recommendations, get_cluster_summary
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -28,13 +28,21 @@ def recommend():
     try:
         user_id = request.args.get('user_id', type=int)
         if not user_id:
-            return jsonify({'error': 'user_id parameter is required'}), 400
+            return jsonify({
+                'message': 'El user_id es requerido',
+                'error': 'Missing user_id',
+                'data': {'user_id': None, 'cluster': None, 'recommendations': []}
+            }), 400
 
         with db.session() as session:
             # Obtener características del usuario
             user_features = get_user_features(user_id, session)
             if user_features is None:
-                return jsonify({'error': 'Error processing user data'}), 500
+                return jsonify({
+                    'message': 'Error al procesar datos del usuario',
+                    'error': 'Error processing user data',
+                    'data': {'user_id': user_id, 'cluster': None, 'recommendations': []}
+                }), 500
 
             # Definir orden exacto de características como en el entrenamiento
             features_order = ['total_spent', 'num_orders', 'total_quantity', 'num_categories', 'avg_rating']
@@ -53,7 +61,7 @@ def recommend():
             # Predecir cluster
             cluster = kmeans.predict(scaled_features)[0]
 
-            # Obtener recomendaciones generales (sin productos comprados)
+            # Obtener recomendaciones generales
             recommendations = []
             seen_products = set()
 
@@ -80,14 +88,21 @@ def recommend():
                 rec.update(detail)
 
             return jsonify({
-                'user_id': user_id,
-                'cluster': int(cluster),
-                'recommendations': recommendations
+                'message': 'Recomendaciones obtenidas exitosamente',
+                'data': {
+                    'user_id': user_id,
+                    'cluster': int(cluster),
+                    'recommendations': recommendations
+                }
             })
 
     except Exception as e:
         app.logger.error(f"Error processing recommendation: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'message': 'Error al obtener recomendaciones',
+            'error': str(e),
+            'data': {'user_id': user_id, 'cluster': None, 'recommendations': []}
+        }), 500
 
 @app.route('/recommend', methods=['POST'])
 def recommend_with_products():
@@ -95,16 +110,24 @@ def recommend_with_products():
         data = request.get_json()
         user_id = data.get('user_id')
         purchased_products = data.get('purchased_products', [])
-        user_data = data.get('user_data')  # Para nuevos usuarios
+        user_data = data.get('user_data')
 
         if not user_id:
-            return jsonify({'error': 'user_id is required', 'status': 'Invalid request'}), 400
+            return jsonify({
+                'message': 'El user_id es requerido',
+                'error': 'Missing user_id',
+                'data': {'user_id': None, 'cluster': None, 'recommendations': []}
+            }), 400
 
         with db.session() as session:
             user = session.query(User).filter_by(user_id=user_id).first()
-            status = 'User registered'
+            status = 'Usuario registrado'
             if not user and not user_data:
-                return jsonify({'error': 'User not found and no user_data provided', 'status': 'Invalid request'}), 400
+                return jsonify({
+                    'message': 'Usuario no encontrado y no se proporcionó user_data',
+                    'error': 'User not found and no user_data provided',
+                    'data': {'user_id': user_id, 'cluster': None, 'recommendations': []}
+                }), 400
 
             # Validar productos comprados
             if purchased_products:
@@ -114,45 +137,56 @@ def recommend_with_products():
                 if not purchased_products and not user_data:
                     cluster, recs = get_recommendations(user_id, [], scaler, kmeans, rules, session)
                     return jsonify({
-                        'user_id': user_id,
-                        'cluster': int(cluster),
-                        'recommendations': recs,
-                        'status': 'No valid purchased products, using default recommendations'
+                        'message': 'No se encontraron productos comprados válidos, usando recomendaciones por defecto',
+                        'data': {
+                            'user_id': user_id,
+                            'cluster': int(cluster),
+                            'recommendations': recs
+                        }
                     })
 
             # Generar recomendaciones
             cluster, recommendations = get_recommendations(user_id, purchased_products, scaler, kmeans, rules, session, user_data)
             if not recommendations:
                 return jsonify({
+                    'message': 'Sin recomendaciones disponibles',
                     'error': f'No recommendations available for cluster {cluster}',
-                    'status': 'No suitable rules found, using default recommendations'
+                    'data': {'user_id': user_id, 'cluster': int(cluster), 'recommendations': []}
                 }), 404
 
             return jsonify({
-                'user_id': user_id,
-                'cluster': int(cluster),
-                'recommendations': recommendations,
-                'status': f'Recommendations based on {status.lower()}'
+                'message': f'Recomendaciones basadas en {status.lower()}',
+                'data': {
+                    'user_id': user_id,
+                    'cluster': int(cluster),
+                    'recommendations': recommendations
+                }
             })
 
     except Exception as e:
         app.logger.error(f"Error processing recommendation with products for user {user_id}: {e}")
-        return jsonify({'error': str(e), 'status': 'Error occurred'}), 500
+        return jsonify({
+            'message': 'Error al obtener recomendaciones',
+            'error': str(e),
+            'data': {'user_id': user_id, 'cluster': None, 'recommendations': []}
+        }), 500
 
-@app.route('/cluster_info', methods=['GET'])
-def get_cluster_info():
+@app.route('/clusters', methods=['GET'])
+def get_clusters():
     try:
-        # Información de clústeres basada en el análisis de la libreta
-        cluster_info = {
-            0: {"description": "Low spending, few orders", "avg_spent": 150, "avg_orders": 2},
-            1: {"description": "Medium spending, regular orders", "avg_spent": 450, "avg_orders": 5},
-            2: {"description": "High spending, frequent orders", "avg_spent": 900, "avg_orders": 8},
-            3: {"description": "Very high spending, VIP customers", "avg_spent": 2000, "avg_orders": 12}
-        }
-        return jsonify(cluster_info)
+        with db.session() as session:
+            cluster_summary = get_cluster_summary(session)
+        return jsonify({
+            'message': 'Resumen de clústeres obtenido exitosamente',
+            'data': cluster_summary
+        })
     except Exception as e:
-        app.logger.error(f"Error fetching cluster info: {e}")
-        return jsonify({'error': str(e)}), 500
+        app.logger.error(f"Error fetching cluster summary: {e}")
+        return jsonify({
+            'message': 'Error al obtener el resumen de clústeres',
+            'error': str(e),
+            'data': {}
+        }), 500
 
 if __name__ == '__main__':
     with app.app_context():
