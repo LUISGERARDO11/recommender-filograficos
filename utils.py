@@ -58,16 +58,15 @@ def get_user_features(user_id: int, db_session) -> Optional[pd.DataFrame]:
         if details:
             total_quantity = sum(d.quantity for d in details)
             num_categories = len(set(d.category_id for d in details))
-            # Calcular promedio de ratings ponderado por cantidad
-            ratings = [float(d.average_rating) * d.quantity for d in details if d.average_rating]
-            total_items = sum(d.quantity for d in details if d.average_rating)
-            avg_rating = sum(ratings) / total_items if total_items > 0 else 0
+            # Promedio simple de ratings, como en la libreta
+            ratings = [float(d.average_rating) for d in details if d.average_rating]
+            avg_rating = sum(ratings) / len(ratings) if ratings else 0
         else:
             total_quantity = 0
             num_categories = 0
             avg_rating = 0
 
-        # Manejo de valores atípicos (igual que en el entrenamiento)
+        # Crear DataFrame
         df = pd.DataFrame({
             'user_id': [user_id],
             'total_spent': [total_spent],
@@ -77,7 +76,7 @@ def get_user_features(user_id: int, db_session) -> Optional[pd.DataFrame]:
             'avg_rating': [avg_rating]
         })
 
-        # Aplicar clip como en el entrenamiento
+        # Aplicar clip como en la libreta
         df['total_spent'] = df['total_spent'].clip(upper=df['total_spent'].quantile(0.95) if not df['total_spent'].empty else total_spent)
         df['total_quantity'] = df['total_quantity'].clip(upper=df['total_quantity'].quantile(0.95) if not df['total_quantity'].empty else total_quantity)
 
@@ -153,7 +152,7 @@ def get_product_details(product_names: List[str], db_session) -> List[Dict]:
             'image_url': p.image_url,
             'created_at': p.created_at.isoformat() if p.created_at else None,
             'updated_at': p.updated_at.isoformat() if p.updated_at else None,
-            'collaborator': None,  # No hay collaborator_id en Product, ajustar si se agrega
+            'collaborator': None,
             'standard_delivery_days': int(p.standard_delivery_days) if p.standard_delivery_days else None,
             'urgent_delivery_enabled': bool(p.urgent_delivery_enabled),
             'urgent_delivery_days': int(p.urgent_delivery_days) if p.urgent_delivery_days else None,
@@ -169,19 +168,19 @@ def get_recommendations(
     purchased_products: Optional[List[str]],
     scaler,
     kmeans,
-    rules: pd.DataFrame,
+    rules_by_cluster: Dict[int, pd.DataFrame],
     db_session,
     user_data: Optional[Dict] = None
 ) -> Tuple[Optional[int], List[Dict[str, Union[str, float]]]]:
     """
-    Generate product recommendations with detailed product information.
+    Generate product recommendations with detailed product information based on cluster-specific rules.
     
     Args:
         user_id (int): ID of the user
         purchased_products (List[str]): List of product names purchased (optional)
         scaler: Pre-trained StandardScaler model
         kmeans: Pre-trained KMeans model
-        rules (pd.DataFrame): DataFrame with association rules
+        rules_by_cluster (Dict[int, pd.DataFrame]): Dictionary of association rules by cluster
         db_session: SQLAlchemy session
         user_data (Dict, optional): Pre-computed user features for new users
     
@@ -189,14 +188,12 @@ def get_recommendations(
         Tuple[Optional[int], List[Dict]]: Cluster ID and list of recommendations with product details
     """
     try:
+        # Obtener características del usuario
         if user_data:
-            # Para nuevos usuarios sin historial
             df = pd.DataFrame([user_data])
         else:
-            # Para usuarios existentes
             user_features = get_user_features(user_id, db_session)
             if user_features is None or user_features.empty:
-                # Valores por defecto para usuarios sin historial
                 df = pd.DataFrame({
                     'user_id': [user_id],
                     'total_spent': [0],
@@ -208,65 +205,68 @@ def get_recommendations(
             else:
                 df = user_features
 
-        # Verificar que tenemos todas las características necesarias
+        # Verificar características requeridas
         required_features = ['total_spent', 'num_orders', 'total_quantity', 'num_categories', 'avg_rating']
-        if not all(feat in df.columns for feat in required_features):
-            missing = [feat for feat in required_features if feat not in df.columns]
-            print(f"Missing features in user data: {missing}")
-            df[missing] = 0  # Asignar valores por defecto
+        missing_features = [feat for feat in required_features if feat not in df.columns]
+        if missing_features:
+            df[missing_features] = 0
 
         # Escalar características y predecir cluster
         X_scaled = scaler.transform(df[required_features])
         cluster = kmeans.predict(X_scaled)[0]
 
-        # Filtrar reglas si hay productos comprados
+        # Obtener productos comprados desde la base de datos si no se proporcionan
+        if not purchased_products:
+            user_products = db_session.query(Product.name).join(
+                ProductVariant, Product.product_id == ProductVariant.product_id
+            ).join(
+                OrderDetail, ProductVariant.variant_id == OrderDetail.variant_id
+            ).join(
+                Order, OrderDetail.order_id == Order.order_id
+            ).filter(
+                Order.user_id == user_id
+            ).distinct().all()
+            purchased_products = [p[0] for p in user_products if p[0]]
+
+        # Obtener reglas del cluster
+        cluster_rules = rules_by_cluster.get(cluster, pd.DataFrame())
+        if cluster_rules.empty:
+            return cluster, []
+
+        # Filtrar reglas basadas en productos comprados
         if purchased_products:
-            filtered_rules = rules[rules['antecedents'].apply(
-                lambda x: any(p in x for p in purchased_products)
-            )]
-            # Si no encontramos reglas, usar las generales
+            valid_products = db_session.query(Product.name).filter(Product.name.in_(purchased_products), Product.status == 'active').all()
+            valid_products = [p[0] for p in valid_products]
+            filtered_rules = cluster_rules[cluster_rules['antecedents'].apply(lambda x: any(p in x for p in valid_products))]
             if filtered_rules.empty:
-                filtered_rules = rules
+                filtered_rules = cluster_rules  # Usar todas las reglas del cluster si no hay coincidencias
         else:
-            filtered_rules = rules
+            filtered_rules = cluster_rules
 
         # Obtener las mejores recomendaciones
-        top_rules = filtered_rules.sort_values(
-            by=['confidence', 'lift'], 
-            ascending=False
-        ).head(5)
-
-        # Procesar recomendaciones
         recommendations = []
-        product_names = []
-        
-        for _, rule in top_rules.iterrows():
-            try:
-                for product_name in list(rule['consequents']):
-                    if product_name not in product_names:
-                        product_names.append(product_name)
-                        recommendations.append({
-                            'product_name': product_name,
-                            'confidence': float(rule['confidence']),
-                            'lift': float(rule['lift'])
-                        })
-                        if len(recommendations) >= 5:
-                            break
-            except Exception as e:
-                print(f"Error formatting recommendation: {str(e)}")
-                continue
+        seen_products = set(purchased_products)
+        for _, rule in filtered_rules.sort_values(by=['confidence', 'lift'], ascending=False).iterrows():
+            for product_name in list(rule['consequents']):
+                if product_name not in seen_products:
+                    seen_products.add(product_name)
+                    recommendations.append({
+                        'product_name': product_name,
+                        'confidence': float(rule['confidence']),
+                        'lift': float(rule['lift'])
+                    })
+                    if len(recommendations) >= 5:
+                        break
             if len(recommendations) >= 5:
                 break
 
         # Obtener detalles completos de los productos
+        product_names = [r['product_name'] for r in recommendations]
         product_details = get_product_details(product_names, db_session)
 
         # Combinar métricas de recomendación con detalles de producto
         for rec in recommendations:
-            product_detail = next(
-                (p for p in product_details if p.get('name') == rec['product_name']), 
-                {}
-            )
+            product_detail = next((p for p in product_details if p.get('name') == rec['product_name']), {})
             rec.update(product_detail)
             rec.pop('product_name', None)  # Eliminar product_name para evitar duplicación con name
 
@@ -276,51 +276,83 @@ def get_recommendations(
         print(f"Error in get_recommendations: {str(e)}")
         return None, []
 
-def get_cluster_summary(db_session) -> Dict:
+def get_cluster_summary(db_session, scaler, kmeans) -> Dict:
     """
     Fetch cluster summary based on the original clustering analysis.
     
     Args:
         db_session: SQLAlchemy session
+        scaler: Pre-trained StandardScaler model
+        kmeans: Pre-trained KMeans model
     
     Returns:
-        Dict: Cluster summary with fields expected by Express
+        Dict: Cluster summary with fields expected by the API
     """
     try:
-        # Obtener el resumen de clústeres desde la base de datos o el análisis original
-        # Simulamos los datos del cluster_summary de la libreta de Jupyter
-        # En un caso real, podrías almacenar esto en una tabla o archivo
-        cluster_summary = {
-            0: {
-                'average_order_quantity': 2.5,  # total_quantity / num_orders
-                'total_spent': 150.0,
-                'number_of_orders': 2,
-                'total_units': 5,
-                'number_of_users': 100
-            },
-            1: {
-                'average_order_quantity': 3.0,
-                'total_spent': 450.0,
-                'number_of_orders': 5,
-                'total_units': 15,
-                'number_of_users': 80
-            },
-            2: {
-                'average_order_quantity': 4.0,
-                'total_spent': 900.0,
-                'number_of_orders': 8,
-                'total_units': 32,
-                'number_of_users': 50
-            },
-            3: {
-                'average_order_quantity': 5.0,
-                'total_spent': 2000.0,
-                'number_of_orders': 12,
-                'total_units': 60,
-                'number_of_users': 20
-            }
+        # Obtener datos de usuarios desde la base de datos
+        users_data = db_session.query(
+            Order.user_id,
+            func.sum(Order.total).label('total_spent'),
+            func.count(Order.order_id).label('num_orders'),
+            func.sum(OrderDetail.quantity).label('total_quantity'),
+            func.count(func.distinct(Product.category_id)).label('num_categories'),
+            func.avg(Product.average_rating).label('avg_rating')
+        ).join(
+            OrderDetail, Order.order_id == OrderDetail.order_id
+        ).join(
+            ProductVariant, OrderDetail.variant_id == ProductVariant.variant_id
+        ).join(
+            Product, ProductVariant.product_id == Product.product_id
+        ).group_by(
+            Order.user_id
+        ).all()
+
+        if not users_data:
+            return {}
+
+        # Crear DataFrame
+        df = pd.DataFrame(
+            [(u.user_id, float(u.total_spent), u.num_orders, u.total_quantity, u.num_categories, float(u.avg_rating or 0))
+             for u in users_data],
+            columns=['user_id', 'total_spent', 'num_orders', 'total_quantity', 'num_categories', 'avg_rating']
+        )
+
+        # Aplicar clip como en la libreta
+        df['total_spent'] = df['total_spent'].clip(upper=df['total_spent'].quantile(0.95))
+        df['total_quantity'] = df['total_quantity'].clip(upper=df['total_quantity'].quantile(0.95))
+
+        # Escalar características
+        required_features = ['total_spent', 'num_orders', 'total_quantity', 'num_categories', 'avg_rating']
+        X_scaled = scaler.transform(df[required_features])
+
+        # Predecir clusters
+        df['cluster'] = kmeans.predict(X_scaled)
+
+        # Generar resumen
+        cluster_summary = df.groupby('cluster').agg({
+            'total_spent': 'mean',
+            'num_orders': 'mean',
+            'total_quantity': 'mean',
+            'num_categories': 'mean',
+            'avg_rating': 'mean',
+            'user_id': 'count'
+        }).reset_index()
+        cluster_summary.columns = [
+            'cluster', 'total_spent', 'number_of_orders', 'total_units',
+            'number_of_categories', 'average_rating', 'number_of_users'
+        ]
+        cluster_summary['average_order_quantity'] = cluster_summary['total_units'] / cluster_summary['number_of_orders']
+
+        # Convertir a formato esperado por la API
+        return {
+            int(row['cluster']): {
+                'average_order_quantity': float(row['average_order_quantity']),
+                'total_spent': float(row['total_spent']),
+                'number_of_orders': int(row['number_of_orders']),
+                'total_units': int(row['total_units']),
+                'number_of_users': int(row['number_of_users'])
+            } for _, row in cluster_summary.iterrows()
         }
-        return cluster_summary
 
     except Exception as e:
         print(f"Error in get_cluster_summary: {str(e)}")

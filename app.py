@@ -4,7 +4,7 @@ from flask_caching import Cache
 import pandas as pd
 import pickle
 from config import Config
-from models import db, User, Product, Order, OrderDetail
+from models import db, User, Product, Order, OrderDetail, ProductVariant
 from utils import get_user_features, get_product_details, get_recommendations, get_cluster_summary
 
 app = Flask(__name__)
@@ -17,8 +17,8 @@ with open('models/kmeans_model.pkl', 'rb') as f:
     kmeans = pickle.load(f)
 with open('models/scaler.pkl', 'rb') as f:
     scaler = pickle.load(f)
-with open('models/rules.pkl', 'rb') as f:
-    rules = pickle.load(f)
+with open('models/rules_by_cluster.pkl', 'rb') as f:
+    rules_by_cluster = pickle.load(f)
 with open('models/transaction_encoder.pkl', 'rb') as f:
     te = pickle.load(f)
 
@@ -27,6 +27,9 @@ with open('models/transaction_encoder.pkl', 'rb') as f:
 def recommend():
     try:
         user_id = request.args.get('user_id', type=int)
+        purchased_products = request.args.get('purchased_products', default='', type=str).split(',')
+        purchased_products = [p for p in purchased_products if p]  # Filtrar vacíos
+
         if not user_id:
             return jsonify({
                 'message': 'El user_id es requerido',
@@ -44,48 +47,38 @@ def recommend():
                     'data': {'user_id': user_id, 'cluster': None, 'recommendations': []}
                 }), 500
 
-            # Definir orden exacto de características como en el entrenamiento
+            # Definir orden de características
             features_order = ['total_spent', 'num_orders', 'total_quantity', 'num_categories', 'avg_rating']
-
-            # Verificar que tenemos todas las características necesarias
             missing_features = [f for f in features_order if f not in user_features.columns]
             if missing_features:
-                user_features[missing_features] = 0  # Valores por defecto
-
-            # Ordenar columnas exactamente como durante el entrenamiento
+                user_features[missing_features] = 0
             user_features = user_features[features_order]
 
-            # Escalar características
+            # Escalar características y predecir cluster
             scaled_features = scaler.transform(user_features)
-
-            # Predecir cluster
             cluster = kmeans.predict(scaled_features)[0]
 
-            # Obtener recomendaciones generales
-            recommendations = []
-            seen_products = set()
+            # Obtener productos comprados desde la base de datos si no se proporcionan
+            if not purchased_products:
+                user_products = session.query(Product.name).join(
+                    ProductVariant, Product.product_id == ProductVariant.product_id
+                ).join(
+                    OrderDetail, ProductVariant.variant_id == OrderDetail.variant_id
+                ).join(
+                    Order, OrderDetail.order_id == Order.order_id
+                ).filter(
+                    Order.user_id == user_id
+                ).distinct().all()
+                purchased_products = [p[0] for p in user_products if p[0]]
 
-            for _, rule in rules.sort_values(by='confidence', ascending=False).iterrows():
-                for product in list(rule['consequents']):
-                    if product not in seen_products:
-                        seen_products.add(product)
-                        recommendations.append({
-                            'product_name': product,
-                            'confidence': float(rule['confidence']),
-                            'lift': float(rule['lift'])
-                        })
-                        if len(recommendations) >= 5:
-                            break
-                if len(recommendations) >= 5:
-                    break
-
-            # Obtener detalles de productos
-            product_names = [r['product_name'] for r in recommendations]
-            product_details = get_product_details(product_names, session)
-
-            # Combinar datos
-            for rec, detail in zip(recommendations, product_details):
-                rec.update(detail)
+            # Generar recomendaciones
+            cluster, recommendations = get_recommendations(user_id, purchased_products, scaler, kmeans, rules_by_cluster, session)
+            if not recommendations:
+                return jsonify({
+                    'message': f'Sin recomendaciones disponibles para el cluster {cluster}',
+                    'error': 'No recommendations available',
+                    'data': {'user_id': user_id, 'cluster': int(cluster), 'recommendations': []}
+                }), 404
 
             return jsonify({
                 'message': 'Recomendaciones obtenidas exitosamente',
@@ -97,7 +90,7 @@ def recommend():
             })
 
     except Exception as e:
-        app.logger.error(f"Error processing recommendation: {e}")
+        app.logger.error(f"Error processing recommendation for user {user_id}: {e}")
         return jsonify({
             'message': 'Error al obtener recomendaciones',
             'error': str(e),
@@ -134,19 +127,9 @@ def recommend_with_products():
                 valid_products = session.query(Product.name).filter(Product.name.in_(purchased_products), Product.status == 'active').all()
                 valid_products = [p[0] for p in valid_products]
                 purchased_products = [p for p in purchased_products if p in valid_products]
-                if not purchased_products and not user_data:
-                    cluster, recs = get_recommendations(user_id, [], scaler, kmeans, rules, session)
-                    return jsonify({
-                        'message': 'No se encontraron productos comprados válidos, usando recomendaciones por defecto',
-                        'data': {
-                            'user_id': user_id,
-                            'cluster': int(cluster),
-                            'recommendations': recs
-                        }
-                    })
 
             # Generar recomendaciones
-            cluster, recommendations = get_recommendations(user_id, purchased_products, scaler, kmeans, rules, session, user_data)
+            cluster, recommendations = get_recommendations(user_id, purchased_products, scaler, kmeans, rules_by_cluster, session, user_data)
             if not recommendations:
                 return jsonify({
                     'message': 'Sin recomendaciones disponibles',
@@ -175,7 +158,7 @@ def recommend_with_products():
 def get_clusters():
     try:
         with db.session() as session:
-            cluster_summary = get_cluster_summary(session)
+            cluster_summary = get_cluster_summary(session, scaler, kmeans)
         return jsonify({
             'message': 'Resumen de clústeres obtenido exitosamente',
             'data': cluster_summary
