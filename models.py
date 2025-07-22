@@ -85,5 +85,3 @@ class OrderDetail(db.Model):
     unit_price = db.Column(db.DECIMAL(10, 2), nullable=False)
     subtotal = db.Column(db.DECIMAL(10, 2), nullable=False)
     additional_cost = db.Column(db.DECIMAL(10, 2), nullable=False, default=0.00)
-    created_at = db.Column(db.DateTime, nullable=True)
-    updated_at = db.Column(db.DateTime, nullable=True)

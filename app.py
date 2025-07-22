@@ -17,10 +17,14 @@ scaler = joblib.load('data/scaler.pkl')
 kmeans = joblib.load('data/kmeans_model.pkl')
 rules_by_cluster = {i: joblib.load(f'data/rules_cluster_{i}.pkl') for i in range(4)}
 
-@app.route('/recommend/<int:user_id>', methods=['GET'])
-@cache.cached(timeout=3600, key_prefix=lambda: f'recommend_{request.view_args["user_id"]}_{pd.Timestamp.now().strftime("%Y%m%d%H")}')
-def recommend(user_id):
+@app.route('/recommendations', methods=['GET'])
+@cache.cached(timeout=3600, key_prefix=lambda: f'recommend_{request.args.get("user_id")}_{pd.Timestamp.now().strftime("%Y%m%d%H")}')
+def recommend():
     try:
+        user_id = request.args.get('user_id', type=int)
+        if not user_id:
+            return jsonify({'error': 'user_id parameter is required', 'status': 'Invalid request'}), 400
+
         with db.session() as session:
             user = session.query(User).filter_by(user_id=user_id).first()
             if not user:
@@ -48,6 +52,9 @@ def recommend_with_products():
         purchased_products = data.get('purchased_products', [])
         user_data = data.get('user_data')  # For new users
         
+        if not user_id:
+            return jsonify({'error': 'user_id is required', 'status': 'Invalid request'}), 400
+
         with db.session() as session:
             user = session.query(User).filter_by(user_id=user_id).first()
             status = 'User registered'

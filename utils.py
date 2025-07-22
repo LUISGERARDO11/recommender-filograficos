@@ -33,7 +33,10 @@ def get_user_features(user_id: int, db_session) -> Optional[pd.DataFrame]:
         )
 
         order_ids = [o.order_id for o in orders]
-        details = db_session.query(OrderDetail).filter(OrderDetail.order_id.in_(order_ids)).all()
+        details = db_session.query(
+            OrderDetail.order_id,
+            OrderDetail.quantity
+        ).filter(OrderDetail.order_id.in_(order_ids)).all()
 
         if not details:
             df_details = pd.DataFrame(columns=['order_id', 'order_quantity'])
